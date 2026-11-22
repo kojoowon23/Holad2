@@ -3,7 +3,7 @@ main = "worker.ts"
 compatibility_date = "2025-01-01"
 
 [placement]
-mode = "smart"
+region = "gcp:us-east4"
 
 # Optional: restrict allowed browser origins once your GitHub Pages URL is live.
 # Example:

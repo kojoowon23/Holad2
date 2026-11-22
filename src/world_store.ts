@@ -116,6 +116,7 @@ export interface PlaceCreationInput {
   x?: number | null;
   z?: number | null;
   yaw?: number | null;
+  unlimitedAdd?: boolean;
 }
 
 export type PlaceCreationResult =
@@ -132,6 +133,7 @@ export interface EnqueueBuildInput {
   x?: number | null;
   z?: number | null;
   yaw?: number | null;
+  unlimitedAdd?: boolean;
 }
 
 export type EnqueueBuildResult =
@@ -162,6 +164,7 @@ interface BuildJobRecord {
   reqX: number | null;
   reqZ: number | null;
   reqYaw: number | null;
+  unlimitedAdd?: boolean;
   simDelayMs: number | null;
   createdAt: number;
   startedAt: number | null;
@@ -1018,15 +1021,17 @@ export class WorldStore {
       );
     }
 
-    const existingTodayId = this.lookupTodayCreation(input.cookieId, input.dayKey);
-    if (existingTodayId) {
-      return {
-        ok: false,
-        status: 403,
-        alreadyPlaced: true,
-        myCreationId: existingTodayId,
-        error: "You've already added your creation for today — come back tomorrow to add another!",
-      };
+    if (!input.unlimitedAdd) {
+      const existingTodayId = this.lookupTodayCreation(input.cookieId, input.dayKey);
+      if (existingTodayId) {
+        return {
+          ok: false,
+          status: 403,
+          alreadyPlaced: true,
+          myCreationId: existingTodayId,
+          error: "You've already added your creation for today — come back tomorrow to add another!",
+        };
+      }
     }
 
     if (input.prompt) {
@@ -1058,17 +1063,19 @@ export class WorldStore {
       };
     }
 
-    const visitorWindowMs = 15 * 60 * 1000;
-    const cidCheck = this.checkWindowBucket(`gen_cid:${input.cookieId}`, 8, visitorWindowMs, now);
-    if (!cidCheck.allowed) {
-      return {
-        ok: false,
-        status: 429,
-        retryAfterSec: cidCheck.retryAfterSec,
-        error: `Please wait ${cidCheck.retryAfterSec ?? 45}s before trying again.`,
-      };
+    if (!input.unlimitedAdd) {
+      const visitorWindowMs = 15 * 60 * 1000;
+      const cidCheck = this.checkWindowBucket(`gen_cid:${input.cookieId}`, 8, visitorWindowMs, now);
+      if (!cidCheck.allowed) {
+        return {
+          ok: false,
+          status: 429,
+          retryAfterSec: cidCheck.retryAfterSec,
+          error: `Please wait ${cidCheck.retryAfterSec ?? 45}s before trying again.`,
+        };
+      }
+      this.incrementWindowBucket(`gen_cid:${input.cookieId}`, visitorWindowMs, now);
     }
-    this.incrementWindowBucket(`gen_cid:${input.cookieId}`, visitorWindowMs, now);
 
     const jobId = `job-${now.toString(36)}-${nodeCrypto.randomUUID().replace(/-/g, "").slice(0, 6)}`;
     const record: BuildJobRecord = {
@@ -1088,6 +1095,7 @@ export class WorldStore {
       reqX: typeof input.x === "number" && Number.isFinite(input.x) ? input.x : null,
       reqZ: typeof input.z === "number" && Number.isFinite(input.z) ? input.z : null,
       reqYaw: typeof input.yaw === "number" && Number.isFinite(input.yaw) ? input.yaw : null,
+      unlimitedAdd: Boolean(input.unlimitedAdd),
       simDelayMs: null,
       createdAt: now,
       startedAt: null,
@@ -1405,6 +1413,7 @@ export class WorldStore {
         x: job.reqX,
         z: job.reqZ,
         yaw: job.reqYaw,
+        unlimitedAdd: Boolean(job.unlimitedAdd),
       });
 
       const finishedAt = Date.now();
@@ -1746,14 +1755,16 @@ export class WorldStore {
   }
 
   public async placeCreation(input: PlaceCreationInput): Promise<PlaceCreationResult> {
-    const existingId = this.lookupTodayCreation(input.cookieId, input.dayKey);
-    if (existingId) {
-      return {
-        ok: false,
-        alreadyPlaced: true,
-        myCreationId: existingId,
-        error: "You've already added your creation for today — come back tomorrow to add another!",
-      };
+    if (!input.unlimitedAdd) {
+      const existingId = this.lookupTodayCreation(input.cookieId, input.dayKey);
+      if (existingId) {
+        return {
+          ok: false,
+          alreadyPlaced: true,
+          myCreationId: existingId,
+          error: "You've already added your creation for today — come back tomorrow to add another!",
+        };
+      }
     }
 
     const cleanPrompt = sanitizePlainText(input.creatorPrompt, 240, true);

@@ -10,9 +10,6 @@ export interface WorkerEnv {
 }
 
 const DEFAULT_SCULPT_MODELS = [
-  "hydrogen-l",
-  "gemini-4-hydrogen",
-  "gemini-4-argon",
   "gemini-3.8-flash",
   "gemini-3.1-pro-preview",
   "gemini-2.5-pro",
@@ -736,8 +733,8 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
       maxOutputTokens: 32_768,
       thinkingBudget: 1024,
       useStream: true,
-      firstByteTimeoutMs: isLite ? 12_000 : 18_000,
-      timeoutMs: isLite ? 28_000 : 54_000,
+      firstByteTimeoutMs: isLite ? 15_000 : 26_000,
+      timeoutMs: isLite ? 32_000 : 54_000,
     });
 
     if (!res.ok) {
@@ -873,11 +870,14 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
     });
   }
 
-  const summary = attempts.join(" | ") || "Model generation failed.";
+  const colo = (request as Request & { cf?: { colo?: string } }).cf?.colo || "unknown";
+  const non404 = attempts.filter((a) => !/: HTTP 404:/i.test(a));
+  const prioritized = [...non404, ...attempts.filter((a) => /: HTTP 404:/i.test(a))];
+  const summary = prioritized.join(" | ") || "Model generation failed.";
   return jsonResponse(request, env, 502, {
     ok: false,
-    error: `Could not sculpt right now (${summary.slice(0, 160)})`,
-    detail: summary,
+    error: `Could not sculpt right now [${colo}] (${summary.slice(0, 150)})`,
+    detail: `[colo=${colo}] ${summary}`,
   });
 }
 
@@ -1060,11 +1060,13 @@ export default {
     }
 
     const url = new URL(request.url);
+    const colo = (request as Request & { cf?: { colo?: string } }).cf?.colo || "unknown";
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/api/health")) {
       return jsonResponse(request, env, 200, {
         ok: true,
         service: "geminisland-ai-proxy",
         hasKey: Boolean((env.GEMINI_API_KEY || "").trim()),
+        colo,
       });
     }
 

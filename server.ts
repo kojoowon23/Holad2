@@ -490,6 +490,7 @@ export async function startServer(customPort?: number) {
           x: typeof body.x === "number" && Number.isFinite(body.x) ? body.x : null,
           z: typeof body.z === "number" && Number.isFinite(body.z) ? body.z : null,
           yaw: typeof body.yaw === "number" && Number.isFinite(body.yaw) ? body.yaw : null,
+          unlimitedAdd: body.unlimitedAdd === true,
         });
 
         if (!enqueued.ok) {

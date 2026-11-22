@@ -174,6 +174,9 @@ let lastAvatarDialogCloseMs = -1000;
 let currentCamMode = "pan";
 let sawTouchInput = false;
 let joyPointerId = null;
+let panTapStreak = 0;
+let lastPanTapMs = 0;
+let unlimitedAddUnlocked = false;
 
 function syncAvatarSwatchDot(app) {
   if (!avatarSwatchDot || !app || typeof app !== "object") return;
@@ -460,13 +463,29 @@ window.__geminIslandCharacterBuilder = characterBuilder;
 
 camPanBtn?.addEventListener("click", () => {
   engine.setDragMode("pan");
+  const nowMs = Date.now();
+  if (nowMs - lastPanTapMs > 6000) {
+    panTapStreak = 0;
+  }
+  lastPanTapMs = nowMs;
+  panTapStreak += 1;
+  if (panTapStreak >= 10 && !unlimitedAddUnlocked) {
+    unlimitedAddUnlocked = true;
+    if (uiState === "placed" || uiState === "ready") {
+      uiState = "idle";
+    }
+    syncDockUI();
+    showToast("Unlimited Add unlocked!", 3500);
+  }
 });
 
 camOrbitBtn?.addEventListener("click", () => {
+  panTapStreak = 0;
   engine.setDragMode("orbit");
 });
 
 camWalkBtn?.addEventListener("click", () => {
+  panTapStreak = 0;
   hoverCard.hidden = true;
   if (engine.isFirstPerson()) {
     engine.setDragMode("pan");
@@ -483,6 +502,7 @@ camWalkBtn?.addEventListener("click", () => {
 });
 
 recenterBtn?.addEventListener("click", () => {
+  panTapStreak = 0;
   engine.recenterCamera();
   engine.setDragMode("pan");
 });
@@ -593,7 +613,7 @@ function syncDockUI() {
   readyGotoBtn.hidden = true;
   locateMineBtn.hidden = true;
 
-  if (myCreationId && uiState !== "ready") {
+  if (myCreationId && !unlimitedAddUnlocked && uiState !== "ready") {
     uiState = "placed";
   }
 
@@ -678,7 +698,7 @@ async function pollActiveJob() {
     if (job.status === "failed") {
       stopJobTracking();
       sculptBtn.disabled = false;
-      if (job.creationId) {
+      if (job.creationId && !unlimitedAddUnlocked) {
         myCreationId = job.creationId;
         uiState = "placed";
         syncDockUI();
@@ -722,7 +742,7 @@ addBtn.addEventListener("click", () => {
   if (engine.isFirstPerson()) {
     engine.setDragMode("pan");
   }
-  if (myCreationId) {
+  if (myCreationId && !unlimitedAddUnlocked) {
     uiState = "placed";
     syncDockUI();
     return;
@@ -782,7 +802,7 @@ worldCanvas.addEventListener("pointerleave", () => {
 readyGotoBtn.addEventListener("click", () => {
   if (!myCreationId) return;
   hoverCard.hidden = true;
-  uiState = "placed";
+  uiState = unlimitedAddUnlocked ? "idle" : "placed";
   syncDockUI();
   engine.focusCreationById(myCreationId);
   const mine = worldData?.creations?.find((c) => c.id === myCreationId) || readyCreation;
@@ -961,6 +981,7 @@ sculptBtn.addEventListener("click", async () => {
         imageDataUrl: selectedImageDataUrl || undefined,
         x: spotX,
         z: spotZ,
+        ...(unlimitedAddUnlocked ? { unlimitedAdd: true } : {}),
       }),
     });
     const data = await res.json();
@@ -968,7 +989,7 @@ sculptBtn.addEventListener("click", async () => {
 
     if (!res.ok || !data.ok) {
       sculptBtn.disabled = false;
-      if (data.alreadyPlaced && data.myCreationId) {
+      if (data.alreadyPlaced && data.myCreationId && !unlimitedAddUnlocked) {
         myCreationId = data.myCreationId;
         uiState = "placed";
         syncDockUI();
@@ -1162,7 +1183,7 @@ async function initWorld() {
         myCreationId = snapshot.myCreationId || null;
         engine.applyWorldSnapshot(worldData);
         if (!isOgCapture && uiState !== "picking" && uiState !== "composing" && uiState !== "building" && uiState !== "ready") {
-          uiState = myCreationId ? "placed" : "idle";
+          uiState = myCreationId && !unlimitedAddUnlocked ? "placed" : "idle";
           syncDockUI();
         }
       },
@@ -1195,7 +1216,7 @@ async function initWorld() {
       myCreationId = worldData.myCreationId || myCreationId || null;
       engine.applyWorldSnapshot(worldData);
       if (!isOgCapture) {
-        if (myCreationId) {
+        if (myCreationId && !unlimitedAddUnlocked) {
           uiState = "placed";
           syncDockUI();
         } else if (worldData.myActiveJob) {
