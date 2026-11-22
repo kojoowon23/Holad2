@@ -1,9 +1,6 @@
 import { checkIslandContentPolicy } from "../src/content_policy";
 import { SCULPTOR_SYSTEM_PROMPT } from "../src/sculptor_prompt";
 import { sanitizePlainText } from "../src/text_sanitize";
-import { normalizeFactualDescription } from "../src/town_planner";
-import { autoRepairBlueprintOverlaps } from "../src/voxel_audit";
-import { normalizeAndGroundBlueprint } from "../src/voxel_dsl";
 
 export interface WorkerEnv {
   GEMINI_API_KEY?: string;
@@ -14,6 +11,7 @@ export interface WorkerEnv {
 
 const DEFAULT_SCULPT_MODELS = [
   "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
   "gemini-2.5-pro",
   "gemini-2.0-flash",
 ] as const;
@@ -289,32 +287,56 @@ async function callGeminiRest(opts: {
 
   try {
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(opts.model)}:generateContent`;
-    const generationConfig: Record<string, unknown> = {
-      maxOutputTokens: opts.maxOutputTokens,
-      responseMimeType: "application/json",
-    };
-    if (typeof opts.temperature === "number") {
-      generationConfig.temperature = opts.temperature;
-    }
-    if (typeof opts.thinkingBudget === "number" && opts.thinkingBudget >= 0) {
-      generationConfig.thinkingConfig = {
-        thinkingBudget: opts.thinkingBudget,
-      };
-    }
+    const supportsThinking = /^gemini-2\.5|^gemini-3/i.test(opts.model);
+    let useThinking = supportsThinking && typeof opts.thinkingBudget === "number" && opts.thinkingBudget >= 0;
+    let useJsonMime = true;
 
-    const res = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "content-type": "application/json",
-        "x-goog-api-key": opts.apiKey,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: opts.systemPrompt }] },
-        contents: [{ role: "user", parts: opts.userParts }],
-        generationConfig,
-      }),
-    });
+    const sendOnce = async () => {
+      const generationConfig: Record<string, unknown> = {
+        maxOutputTokens: opts.maxOutputTokens,
+        ...(useJsonMime ? { responseMimeType: "application/json" } : {}),
+      };
+      if (typeof opts.temperature === "number") {
+        generationConfig.temperature = opts.temperature;
+      }
+      if (useThinking) {
+        generationConfig.thinkingConfig = {
+          thinkingBudget: opts.thinkingBudget,
+        };
+      }
+      return fetch(endpoint, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          "x-goog-api-key": opts.apiKey,
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: opts.systemPrompt }] },
+          contents: [{ role: "user", parts: opts.userParts }],
+          generationConfig,
+        }),
+      });
+    };
+
+    let res = await sendOnce();
+    if (!res.ok && res.status === 400) {
+      const errBody = await res.text().catch(() => "");
+      if (useThinking && /thinking|thought/i.test(errBody)) {
+        useThinking = false;
+        res = await sendOnce();
+      } else if (useJsonMime && /mime|json/i.test(errBody)) {
+        useJsonMime = false;
+        res = await sendOnce();
+      } else {
+        clearTimeout(timer);
+        return {
+          ok: false,
+          httpStatus: res.status,
+          reason: `HTTP ${res.status}: ${redactKey(errBody.slice(0, 160), opts.apiKey)}`,
+        };
+      }
+    }
 
     clearTimeout(timer);
 
@@ -435,11 +457,11 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
       temperature: 0.42,
       maxOutputTokens: 24_576,
       thinkingBudget: 512,
-      timeoutMs: 32_000,
+      timeoutMs: 45_000,
     });
 
     if (!res.ok) {
-      lastError = res.reason;
+      lastError = `${model}: ${res.reason}`;
       if (/API_KEY_INVALID|API key not valid|invalid api key/i.test(res.reason)) {
         return jsonResponse(request, env, 502, {
           ok: false,
@@ -471,48 +493,33 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
       }
 
       if (!Array.isArray(json.ops) || json.ops.length === 0) {
-        lastError = "Missing ops in blueprint";
+        lastError = `${model}: Missing ops in blueprint`;
         continue;
       }
 
-      const draft = normalizeAndGroundBlueprint(json, promptText || "Meadow Creation", {
-        skipAutoRepair: true,
-        contextText: promptText,
-      });
-      if (draft.stats.voxels < 25) {
-        lastError = "Sculpted voxel count too small";
-        continue;
-      }
+      const name = sanitizePlainText(json.name, 64) || "Meadow Creation";
+      const description = sanitizePlainText(json.description, 200);
+      const extractedSubject = sanitizePlainText(json.extractedSubject, 100, true) || name;
 
-      const repaired = autoRepairBlueprintOverlaps(draft).blueprint;
-      const finalBp = {
-        ...repaired,
-        description: normalizeFactualDescription(repaired.description),
-      };
-      const extractedSubject =
-        sanitizePlainText(json.extractedSubject, 100, true) || finalBp.name;
-
-      const outputBlocked = quickSafetyPrecheck(
-        `${finalBp.name} ${finalBp.description} ${extractedSubject}`,
-      );
+      const outputBlocked = quickSafetyPrecheck(`${name} ${description} ${extractedSubject}`);
       if (outputBlocked) {
         return jsonResponse(request, env, 422, { ok: false, unsafe: true, error: outputBlocked });
       }
 
       return jsonResponse(request, env, 200, {
         ok: true,
-        blueprint: finalBp,
+        blueprint: json,
         extractedSubject,
         modelUsed: model,
       });
     } catch (err) {
-      lastError = redactKey(err, apiKey).slice(0, 120);
+      lastError = `${model}: ${redactKey(err, apiKey).slice(0, 120)}`;
     }
   }
 
   return jsonResponse(request, env, 502, {
     ok: false,
-    error: "Could not sculpt that right now — please try again.",
+    error: `Could not sculpt right now (${lastError.slice(0, 120)})`,
     detail: lastError,
   });
 }
