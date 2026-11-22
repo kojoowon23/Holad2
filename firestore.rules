@@ -1,0 +1,163 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Global Helpers
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // 3. Entity Validators
+    function isValidCreation(data) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'ownerName', 'visibility', 'name', 'description',
+          'category', 'scaleClass', 'x', 'z', 'yaw', 'blueprint', 'behavior',
+          'integratedLevel', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'ownerName', 'visibility', 'name', 'description',
+          'category', 'scaleClass', 'x', 'z', 'yaw', 'blueprint', 'behavior',
+          'liveFeed', 'integratedLevel', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerId)
+        && data.ownerName is string && data.ownerName.size() <= 32
+        && data.visibility == 'public'
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 64
+        && data.description is string && data.description.size() <= 280
+        && data.category in ['vehicle', 'creature', 'building', 'prop', 'aircraft', 'watercraft']
+        && data.scaleClass in ['tiny', 'small', 'medium', 'large', 'colossal']
+        && data.x is number && data.x >= -220 && data.x <= 220
+        && data.z is number && data.z >= -220 && data.z <= 220
+        && data.yaw is number && data.yaw >= -6.3 && data.yaw <= 6.3
+        && data.integratedLevel is number && data.integratedLevel >= 0 && data.integratedLevel <= 10
+        && data.blueprint is map
+        && data.blueprint.keys().hasAll(['name', 'category', 'palette', 'ops'])
+        && data.blueprint.name is string && data.blueprint.name.size() >= 1 && data.blueprint.name.size() <= 64
+        && data.blueprint.palette is map
+        && data.blueprint.ops is list && data.blueprint.ops.size() >= 1 && data.blueprint.ops.size() <= 120
+        && data.blueprint.ops[0] is map
+        && data.behavior is map
+        && (!('liveFeed' in data) || data.liveFeed == null || data.liveFeed is map)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPresence(data) {
+      return data.keys().hasAll([
+          'uid', 'visibility', 'name', 'appearance', 'mode',
+          'x', 'y', 'z', 'yaw', 'pitch', 'vx', 'vz',
+          'anim', 'seat', 'emoteAt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid', 'visibility', 'name', 'appearance', 'mode',
+          'x', 'y', 'z', 'yaw', 'pitch', 'vx', 'vz',
+          'anim', 'ride', 'seat', 'room', 'emote', 'emoteAt',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && data.visibility == 'public'
+        && data.name is string && data.name.size() <= 24
+        && data.appearance is map
+        && data.mode in ['walk', 'aerial']
+        && data.x is number && data.x >= -240 && data.x <= 240
+        && data.y is number && data.y >= -20 && data.y <= 600
+        && data.z is number && data.z >= -240 && data.z <= 240
+        && data.yaw is number && data.yaw >= -6.3 && data.yaw <= 6.3
+        && data.pitch is number && data.pitch >= -1.6 && data.pitch <= 1.6
+        && data.vx is number && data.vx >= -25 && data.vx <= 25
+        && data.vz is number && data.vz >= -25 && data.vz <= 25
+        && data.anim in ['idle', 'walk', 'run', 'jump', 'ride', 'sit', 'wave']
+        && (!('ride' in data) || data.ride == null || (data.ride is string && data.ride.size() <= 48))
+        && data.seat is number && data.seat >= 0 && data.seat <= 3
+        && (!('room' in data) || data.room == null || (data.room is string && data.room.size() <= 48))
+        && (!('emote' in data) || data.emote == null || data.emote in ['wave', 'jump', 'cheer'])
+        && data.emoteAt is number && data.emoteAt >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // 4. Collections
+    match /creations/{creationId} {
+      allow get, list: if existing().visibility == 'public'
+        || (isSignedIn() && existing().ownerId == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(creationId)
+        && isValidCreation(incoming())
+        && incoming().id == creationId
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(creationId)
+        && isValidCreation(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().id == existing().id
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'description', 'x', 'z', 'yaw', 'updatedAt'
+        ]);
+
+      allow delete: if isVerifiedUser()
+        && isValidId(creationId)
+        && existing().ownerId == request.auth.uid;
+    }
+
+    match /presence/{uid} {
+      allow get: if existing().visibility == 'public'
+        || (isSignedIn() && uid == request.auth.uid);
+
+      allow list: if existing().visibility == 'public'
+        || (isSignedIn() && existing().uid == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(uid)
+        && uid == request.auth.uid
+        && isValidPresence(incoming())
+        && incoming().uid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(uid)
+        && uid == request.auth.uid
+        && isValidPresence(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'appearance', 'mode', 'x', 'y', 'z', 'yaw', 'pitch',
+          'vx', 'vz', 'anim', 'ride', 'seat', 'room', 'emote', 'emoteAt', 'updatedAt'
+        ]);
+
+      allow delete: if isVerifiedUser()
+        && isValidId(uid)
+        && uid == request.auth.uid;
+    }
+  }
+}

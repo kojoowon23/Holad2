@@ -1,0 +1,199 @@
+{
+  "entities": {
+    "IslandCreation": {
+      "title": "IslandCreation",
+      "description": "A user-contributed 3D voxel creation placed on the shared GeminIsland.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique creation document identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the creator."
+        },
+        "ownerName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 32,
+          "description": "Public display nickname of the creator."
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["public"],
+          "description": "Visibility scope on the shared island."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Creation title."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 280,
+          "description": "Short factual description."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["vehicle", "creature", "building", "prop", "aircraft", "watercraft"],
+          "description": "Voxel creation category."
+        },
+        "scaleClass": {
+          "type": "string",
+          "enum": ["tiny", "small", "medium", "large", "colossal"],
+          "description": "Voxel scale class."
+        },
+        "x": {
+          "type": "number",
+          "description": "World X coordinate in meters."
+        },
+        "z": {
+          "type": "number",
+          "description": "World Z coordinate in meters."
+        },
+        "yaw": {
+          "type": "number",
+          "description": "Heading angle in radians."
+        },
+        "blueprint": {
+          "type": "object",
+          "description": "Voxel DSL blueprint map (palette, ops, parts)."
+        },
+        "behavior": {
+          "type": "object",
+          "description": "Animation and roaming behavior metadata."
+        },
+        "liveFeed": {
+          "type": "object",
+          "description": "Optional live feed specification."
+        },
+        "integratedLevel": {
+          "type": "number",
+          "description": "World integration level."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "ownerName",
+        "visibility",
+        "name",
+        "description",
+        "category",
+        "scaleClass",
+        "x",
+        "z",
+        "yaw",
+        "blueprint",
+        "behavior",
+        "integratedLevel",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PlayerPresence": {
+      "title": "PlayerPresence",
+      "description": "Live multiplayer avatar pose and appearance on GeminIsland.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID matching the document ID."
+        },
+        "visibility": {
+          "type": "string",
+          "enum": ["public"],
+          "description": "Visibility scope on the shared island."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 24,
+          "description": "Avatar display name."
+        },
+        "appearance": {
+          "type": "object",
+          "description": "Voxel avatar appearance colors and style tokens."
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["walk", "aerial"],
+          "description": "Player camera/movement mode."
+        },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" },
+        "yaw": { "type": "number" },
+        "pitch": { "type": "number" },
+        "vx": { "type": "number" },
+        "vz": { "type": "number" },
+        "anim": {
+          "type": "string",
+          "enum": ["idle", "walk", "run", "jump", "ride", "sit", "wave"],
+          "description": "Current avatar animation."
+        },
+        "seat": { "type": "number" },
+        "emoteAt": { "type": "number" },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "visibility",
+        "name",
+        "appearance",
+        "mode",
+        "x",
+        "y",
+        "z",
+        "yaw",
+        "pitch",
+        "vx",
+        "vz",
+        "anim",
+        "seat",
+        "emoteAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/creations/{creationId}": {
+      "schema": { "$ref": "#/entities/IslandCreation" },
+      "description": "Publicly visible community 3D voxel creations owned by verified creators."
+    },
+    "/presence/{uid}": {
+      "schema": { "$ref": "#/entities/PlayerPresence" },
+      "description": "Live multiplayer avatar state keyed by authenticated user UID."
+    }
+  }
+}
