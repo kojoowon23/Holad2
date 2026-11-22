@@ -10,15 +10,14 @@ export interface WorkerEnv {
 }
 
 const DEFAULT_SCULPT_MODELS = [
-  "gemini-3.8-flash",
-  "gemini-3.1-flash-lite",
-  "gemini-3.1-pro-preview",
   "hydrogen-l",
   "gemini-4-hydrogen",
   "gemini-4-argon",
-  "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
+  "gemini-3.8-flash",
+  "gemini-3.1-pro-preview",
   "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-3.1-flash-lite",
 ] as const;
 
 const DEFAULT_MINIGAME_MODELS = [
@@ -330,6 +329,199 @@ async function discoverFallbackModels(
   }
 }
 
+function consumeSseLine(
+  rawLine: string,
+  acc: { nonThought: string; all: string; blockReason: string | null; streamError: string | null },
+): void {
+  const line = rawLine.trim();
+  if (!line.startsWith("data:")) return;
+  const payload = line.slice(5).trim();
+  if (!payload || payload === "[DONE]") return;
+
+  let ev: {
+    error?: { code?: number; message?: string; status?: string };
+    promptFeedback?: { blockReason?: string };
+    candidates?: {
+      content?: { parts?: { text?: string; thought?: boolean }[] };
+    }[];
+  };
+  try {
+    ev = JSON.parse(payload);
+  } catch {
+    return;
+  }
+
+  if (ev.error) {
+    acc.streamError = `SSE ${ev.error.code ?? ""} ${ev.error.status ?? ""}: ${ev.error.message ?? "stream error"}`.trim();
+    return;
+  }
+  if (ev.promptFeedback?.blockReason) {
+    acc.blockReason = ev.promptFeedback.blockReason;
+  }
+  const parts = ev.candidates?.[0]?.content?.parts ?? [];
+  for (const p of parts) {
+    if (typeof p.text === "string") {
+      acc.all += p.text;
+      if (!p.thought) acc.nonThought += p.text;
+    }
+  }
+}
+
+async function callGeminiSingleAttempt(opts: {
+  model: string;
+  apiKey: string;
+  systemPrompt: string;
+  userParts: Record<string, unknown>[];
+  generationConfig: Record<string, unknown>;
+  stream: boolean;
+  firstByteTimeoutMs: number;
+  totalTimeoutMs: number;
+}): Promise<
+  | { ok: true; rawText: string; blockReason: string | null }
+  | { ok: false; httpStatus?: number; errorBody?: string; transportDropped?: boolean; reason: string }
+> {
+  const controller = new AbortController();
+  let abortReason = `Timeout(${opts.totalTimeoutMs}ms)`;
+  const totalTimer = setTimeout(() => {
+    abortReason = `Timeout(${opts.totalTimeoutMs}ms)`;
+    controller.abort();
+  }, opts.totalTimeoutMs);
+
+  let firstByteTimer: ReturnType<typeof setTimeout> | null = opts.stream
+    ? setTimeout(() => {
+        abortReason = `FirstByteTimeout(${opts.firstByteTimeoutMs}ms)`;
+        controller.abort();
+      }, opts.firstByteTimeoutMs)
+    : null;
+
+  const clearTimers = () => {
+    clearTimeout(totalTimer);
+    if (firstByteTimer !== null) {
+      clearTimeout(firstByteTimer);
+      firstByteTimer = null;
+    }
+  };
+
+  let received200 = false;
+  try {
+    const action = opts.stream ? "streamGenerateContent?alt=sse" : "generateContent";
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(opts.model)}:${action}`;
+    const res = await fetch(endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        "x-goog-api-key": opts.apiKey,
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: opts.systemPrompt }] },
+        contents: [{ role: "user", parts: opts.userParts }],
+        generationConfig: opts.generationConfig,
+      }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      clearTimers();
+      return {
+        ok: false,
+        httpStatus: res.status,
+        errorBody: errBody,
+        reason: `HTTP ${res.status}: ${redactKey(errBody.slice(0, 160), opts.apiKey)}`,
+      };
+    }
+
+    received200 = true;
+
+    if (!opts.stream) {
+      clearTimers();
+      const payload = (await res.json()) as {
+        promptFeedback?: { blockReason?: string };
+        candidates?: {
+          content?: { parts?: { text?: string; thought?: boolean }[] };
+        }[];
+      };
+      const parts = payload.candidates?.[0]?.content?.parts ?? [];
+      let nonThought = "";
+      let all = "";
+      for (const p of parts) {
+        if (typeof p.text === "string") {
+          all += p.text;
+          if (!p.thought) nonThought += p.text;
+        }
+      }
+      return {
+        ok: true,
+        rawText: nonThought.trim() || all.trim(),
+        blockReason: payload.promptFeedback?.blockReason ?? null,
+      };
+    }
+
+    if (!res.body) {
+      clearTimers();
+      return { ok: false, transportDropped: true, reason: "Empty stream body" };
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const acc = { nonThought: "", all: "", blockReason: null as string | null, streamError: null as string | null };
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value && value.byteLength > 0) {
+        if (firstByteTimer !== null) {
+          clearTimeout(firstByteTimer);
+          firstByteTimer = null;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          consumeSseLine(line, acc);
+          if (acc.streamError) {
+            await reader.cancel().catch(() => {});
+            clearTimers();
+            return { ok: false, reason: redactKey(acc.streamError, opts.apiKey).slice(0, 140) };
+          }
+        }
+      }
+      if (done) break;
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      for (const line of buffer.split(/\r?\n/)) {
+        consumeSseLine(line, acc);
+      }
+    }
+    clearTimers();
+
+    if (acc.streamError) {
+      return { ok: false, reason: redactKey(acc.streamError, opts.apiKey).slice(0, 140) };
+    }
+
+    const rawText = acc.nonThought.trim() || acc.all.trim();
+    if (!rawText && !acc.blockReason) {
+      return { ok: false, transportDropped: true, reason: "Empty SSE text" };
+    }
+
+    return {
+      ok: true,
+      rawText,
+      blockReason: acc.blockReason,
+    };
+  } catch (err) {
+    clearTimers();
+    const aborted = controller.signal.aborted;
+    return {
+      ok: false,
+      transportDropped: !aborted && received200,
+      reason: aborted ? abortReason : redactKey(err, opts.apiKey).slice(0, 140),
+    };
+  }
+}
+
 async function callGeminiRest(opts: {
   model: string;
   apiKey: string;
@@ -339,120 +531,94 @@ async function callGeminiRest(opts: {
   maxOutputTokens: number;
   thinkingBudget?: number;
   timeoutMs: number;
+  firstByteTimeoutMs?: number;
+  useStream?: boolean;
 }): Promise<
   | { ok: true; rawText: string; blockReason: string | null }
   | { ok: false; httpStatus?: number; reason: string }
 > {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
+  const isModernOrHydrogen = HYDROGEN_OR_MODERN_RE.test(opts.model);
+  let thinkingMode: "native" | "budget" | "none" = isModernOrHydrogen
+    ? "native"
+    : /^gemini-2\.5|^gemini-3/i.test(opts.model) &&
+        typeof opts.thinkingBudget === "number" &&
+        opts.thinkingBudget > 0
+      ? "budget"
+      : "none";
+  let temperature = OMIT_TEMP_MODEL_RE.test(opts.model) ? undefined : opts.temperature;
+  let maxOutputTokens = opts.maxOutputTokens;
+  let useJsonMime = true;
+  const stream = Boolean(opts.useStream);
+  const firstByteMs = opts.firstByteTimeoutMs ?? Math.min(18_000, opts.timeoutMs);
 
-  try {
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(opts.model)}:generateContent`;
-    const isModernOrHydrogen = HYDROGEN_OR_MODERN_RE.test(opts.model);
-    let thinkingMode: "native" | "budget" | "none" = isModernOrHydrogen
-      ? "native"
-      : /^gemini-2\.5|^gemini-3/i.test(opts.model) &&
-          typeof opts.thinkingBudget === "number" &&
-          opts.thinkingBudget > 0
-        ? "budget"
-        : "none";
-    let temperature = OMIT_TEMP_MODEL_RE.test(opts.model) ? undefined : opts.temperature;
-    let maxOutputTokens = opts.maxOutputTokens;
-    let useJsonMime = true;
-
-    const sendOnce = async () => {
-      const generationConfig: Record<string, unknown> = {
-        maxOutputTokens,
-        ...(useJsonMime ? { responseMimeType: "application/json" } : {}),
-      };
-      if (typeof temperature === "number") {
-        generationConfig.temperature = temperature;
-      }
-      if (thinkingMode === "native") {
-        generationConfig.thinkingConfig = { includeThoughts: true };
-      } else if (thinkingMode === "budget") {
-        generationConfig.thinkingConfig = { thinkingBudget: opts.thinkingBudget };
-      }
-      return fetch(endpoint, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "content-type": "application/json",
-          "x-goog-api-key": opts.apiKey,
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: opts.systemPrompt }] },
-          contents: [{ role: "user", parts: opts.userParts }],
-          generationConfig,
-        }),
-      });
+  const buildGenCfg = (): Record<string, unknown> => {
+    const cfg: Record<string, unknown> = {
+      maxOutputTokens,
+      ...(useJsonMime ? { responseMimeType: "application/json" } : {}),
     };
+    if (typeof temperature === "number") cfg.temperature = temperature;
+    if (thinkingMode === "native") cfg.thinkingConfig = { includeThoughts: true };
+    else if (thinkingMode === "budget") cfg.thinkingConfig = { thinkingBudget: opts.thinkingBudget };
+    return cfg;
+  };
 
-    let res = await sendOnce();
-    let lastErrBody = "";
-    for (let compatPass = 0; compatPass < 3 && !res.ok && res.status === 400; compatPass++) {
-      lastErrBody = await res.text().catch(() => "");
-      let adjusted = false;
-      if (thinkingMode !== "none" && /thinking|thought/i.test(lastErrBody)) {
-        thinkingMode = "none";
-        adjusted = true;
-      } else if (temperature !== undefined && /temperature|sampling/i.test(lastErrBody)) {
-        temperature = undefined;
-        adjusted = true;
-      } else if (maxOutputTokens > 16_384 && /max_?output_?tokens|output.*token|token.*limit/i.test(lastErrBody)) {
-        maxOutputTokens = 16_384;
-        adjusted = true;
-      } else if (useJsonMime && /mime|json/i.test(lastErrBody)) {
-        useJsonMime = false;
-        adjusted = true;
-      }
-      if (!adjusted) break;
-      lastErrBody = "";
-      res = await sendOnce();
+  let res = await callGeminiSingleAttempt({
+    model: opts.model,
+    apiKey: opts.apiKey,
+    systemPrompt: opts.systemPrompt,
+    userParts: opts.userParts,
+    generationConfig: buildGenCfg(),
+    stream,
+    firstByteTimeoutMs: firstByteMs,
+    totalTimeoutMs: opts.timeoutMs,
+  });
+
+  for (let compatPass = 0; compatPass < 3 && !res.ok && res.httpStatus === 400 && res.errorBody; compatPass++) {
+    const errBody = res.errorBody;
+    let adjusted = false;
+    if (thinkingMode !== "none" && /thinking|thought/i.test(errBody)) {
+      thinkingMode = "none";
+      adjusted = true;
+    } else if (temperature !== undefined && /temperature|sampling/i.test(errBody)) {
+      temperature = undefined;
+      adjusted = true;
+    } else if (maxOutputTokens > 16_384 && /max_?output_?tokens|output.*token|token.*limit/i.test(errBody)) {
+      maxOutputTokens = 16_384;
+      adjusted = true;
+    } else if (useJsonMime && /mime|json/i.test(errBody)) {
+      useJsonMime = false;
+      adjusted = true;
     }
-
-    clearTimeout(timer);
-
-    if (!res.ok) {
-      const errBody = lastErrBody || (await res.text().catch(() => ""));
-      return {
-        ok: false,
-        httpStatus: res.status,
-        reason: `HTTP ${res.status}: ${redactKey(errBody.slice(0, 160), opts.apiKey)}`,
-      };
-    }
-
-    const payload = (await res.json()) as {
-      promptFeedback?: { blockReason?: string };
-      candidates?: {
-        content?: { parts?: { text?: string; thought?: boolean }[] };
-      }[];
-    };
-
-    const parts = payload.candidates?.[0]?.content?.parts ?? [];
-    let nonThought = "";
-    let all = "";
-    for (const p of parts) {
-      if (typeof p.text === "string") {
-        all += p.text;
-        if (!p.thought) nonThought += p.text;
-      }
-    }
-
-    return {
-      ok: true,
-      rawText: nonThought.trim() || all.trim(),
-      blockReason: payload.promptFeedback?.blockReason ?? null,
-    };
-  } catch (err) {
-    clearTimeout(timer);
-    return {
-      ok: false,
-      reason: controller.signal.aborted
-        ? `Timeout(${opts.timeoutMs}ms)`
-        : redactKey(err, opts.apiKey).slice(0, 140),
-    };
+    if (!adjusted) break;
+    res = await callGeminiSingleAttempt({
+      model: opts.model,
+      apiKey: opts.apiKey,
+      systemPrompt: opts.systemPrompt,
+      userParts: opts.userParts,
+      generationConfig: buildGenCfg(),
+      stream,
+      firstByteTimeoutMs: firstByteMs,
+      totalTimeoutMs: opts.timeoutMs,
+    });
   }
+
+  if (!res.ok && stream && res.transportDropped) {
+    res = await callGeminiSingleAttempt({
+      model: opts.model,
+      apiKey: opts.apiKey,
+      systemPrompt: opts.systemPrompt,
+      userParts: opts.userParts,
+      generationConfig: buildGenCfg(),
+      stream: false,
+      firstByteTimeoutMs: opts.timeoutMs,
+      totalTimeoutMs: Math.min(45_000, opts.timeoutMs),
+    });
+  }
+
+  if (!res.ok) {
+    return { ok: false, httpStatus: res.httpStatus, reason: res.reason };
+  }
+  return res;
 }
 
 async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> {
@@ -508,9 +674,9 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
 
   const userDirective = imageBase64
     ? promptText
-      ? `Extract the main foreground subject from this image guided by the user's description below and sculpt an ultra-detailed 3D micro-voxel miniature with rich parts and colors.\n<untrusted_user_description>\n${promptText}\n</untrusted_user_description>`
-      : `Carefully inspect this uploaded image, isolate the main foreground object/creature/vehicle/building, and sculpt an ultra-detailed, faithful 3D micro-voxel miniature of it with animated parts.`
-    : `Sculpt an ultra-detailed, iconic 3D micro-voxel miniature of the subject described below. Include rich surface greebles, harmonious custom palette, emissive details, and lifelike animated parts.\n<untrusted_user_description>\n${promptText}\n</untrusted_user_description>`;
+      ? `Extract the main foreground subject from this image guided by the user's description below and sculpt an ultra-detailed 3D micro-voxel miniature with 26-48 layered ops, sculpted curves, rich color palette, surface greebles, and animated parts.\n<untrusted_user_description>\n${promptText}\n</untrusted_user_description>`
+      : `Carefully inspect this uploaded image, isolate the main foreground object/creature/vehicle/building, and sculpt an ultra-detailed, faithful 3D micro-voxel miniature with 26-48 layered ops, rich custom color palette, surface details, and animated parts.`
+    : `Sculpt an ultra-detailed, iconic 3D micro-voxel miniature of the subject described below. Use 26-48 layered ops (combining roundedBox, sphere, dome, cylinder, ring, cone, arch, hollowBox, line, clear/carve), harmonious custom hex colors, crisp trim/surface greebles, emissive accents, and lifelike animated parts.\n<untrusted_user_description>\n${promptText}\n</untrusted_user_description>`;
 
   const userParts: Record<string, unknown>[] = [];
   if (imageBase64 && imageMimeType) {
@@ -518,27 +684,64 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
   }
   userParts.push({ text: userDirective });
 
+  const scoreBlueprintRichness = (bp: Record<string, unknown>): { opsCount: number; score: number } => {
+    const ops = Array.isArray(bp.ops) ? bp.ops : [];
+    const parts = Array.isArray(bp.parts) ? bp.parts : [];
+    const shapes = new Set<string>();
+    const colors = new Set<string>();
+    let hasCarve = false;
+    for (const op of ops) {
+      if (op && typeof op === "object") {
+        const rec = op as Record<string, unknown>;
+        const shape = String(rec.op ?? "");
+        if (shape) shapes.add(shape);
+        if (typeof rec.color === "string" && rec.color) colors.add(rec.color.toLowerCase());
+        if (rec.op === "clear" || rec.carve === true) hasCarve = true;
+      }
+    }
+    const score =
+      Math.min(ops.length, 52) * 2 +
+      shapes.size * 5 +
+      Math.min(colors.size, 12) * 2 +
+      Math.min(parts.length, 4) * 6 +
+      (hasCarve ? 6 : 0);
+    return { opsCount: ops.length, score };
+  };
+
+  const tStart = Date.now();
   const models = parseModelOrder(env.GEMINI_SCULPT_MODEL, DEFAULT_SCULPT_MODELS);
   const attempts: string[] = [];
   let saw404 = false;
   let discoveredTried = false;
 
+  interface SculptCandidate {
+    blueprint: Record<string, unknown>;
+    extractedSubject: string;
+    modelUsed: string;
+    opsCount: number;
+    score: number;
+  }
+
+  let best: SculptCandidate | null = null;
+
   for (let idx = 0; idx < models.length; idx++) {
     const model = models[idx];
+    const isLite = /flash-lite/i.test(model);
     const res = await callGeminiRest({
       model,
       apiKey,
       systemPrompt: SCULPTOR_SYSTEM_PROMPT,
       userParts,
       temperature: 0.42,
-      maxOutputTokens: 24_576,
-      thinkingBudget: 512,
-      timeoutMs: 32_000,
+      maxOutputTokens: 32_768,
+      thinkingBudget: 1024,
+      useStream: true,
+      firstByteTimeoutMs: isLite ? 12_000 : 18_000,
+      timeoutMs: isLite ? 28_000 : 54_000,
     });
 
     if (!res.ok) {
-      const note = `${model}: ${res.reason}`;
-      attempts.push(note);
+      attempts.push(`${model}: ${res.reason}`);
       if (res.httpStatus === 404) saw404 = true;
       if (/API_KEY_INVALID|API key not valid|invalid api key/i.test(res.reason)) {
         return jsonResponse(request, env, 502, {
@@ -589,15 +792,85 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
         return jsonResponse(request, env, 422, { ok: false, unsafe: true, error: outputBlocked });
       }
 
-      return jsonResponse(request, env, 200, {
-        ok: true,
+      const { opsCount, score } = scoreBlueprintRichness(json);
+      const cand: SculptCandidate = {
         blueprint: json,
         extractedSubject,
         modelUsed: model,
+        opsCount,
+        score,
+      };
+      if (!best || cand.score > best.score) {
+        best = cand;
+      }
+
+      // If this draft is sparse (< 18 ops) and we still have time budget, run a 1-pass detail upgrade
+      if (opsCount < 18 && Date.now() - tStart < 34_000) {
+        const refineParts: Record<string, unknown>[] = [];
+        if (imageBase64 && imageMimeType) {
+          refineParts.push({ inlineData: { mimeType: imageMimeType, data: imageBase64 } });
+        }
+        refineParts.push({
+          text: `${userDirective}\n\nUPGRADE THIS SPARSE DRAFT (${opsCount} ops -> 26-44 ops):\nKeep the subject identity and orientation, replace simple boxes with expressive sculpted primitives (roundedBox, sphere, dome, arch, cylinder, ring, cone, hollowBox, line, clear/carve), add architectural/organic surface trim, finer proportions, emissive details, and >=1 voxel clearance on animated parts.\n\nDraft JSON:\n${JSON.stringify(json)}`,
+        });
+
+        const refined = await callGeminiRest({
+          model,
+          apiKey,
+          systemPrompt: SCULPTOR_SYSTEM_PROMPT,
+          userParts: refineParts,
+          temperature: 0.35,
+          maxOutputTokens: 36_864,
+          thinkingBudget: 1280,
+          useStream: true,
+          firstByteTimeoutMs: 16_000,
+          timeoutMs: 42_000,
+        });
+
+        if (refined.ok && refined.rawText) {
+          try {
+            const refJson = extractJsonObject(refined.rawText);
+            if (refJson.safe !== false && Array.isArray(refJson.ops) && refJson.ops.length > 0) {
+              const refName = sanitizePlainText(refJson.name, 64) || name;
+              const refDesc = sanitizePlainText(refJson.description, 200);
+              const refSubj = sanitizePlainText(refJson.extractedSubject, 100, true) || extractedSubject;
+              if (!quickSafetyPrecheck(`${refName} ${refDesc} ${refSubj}`)) {
+                const refRich = scoreBlueprintRichness(refJson);
+                if (refRich.score >= best.score) {
+                  best = {
+                    blueprint: refJson,
+                    extractedSubject: refSubj,
+                    modelUsed: `${model}-refined`,
+                    opsCount: refRich.opsCount,
+                    score: refRich.score,
+                  };
+                }
+              }
+            }
+          } catch {
+            // Keep initial candidate if refinement JSON parse fails
+          }
+        }
+      }
+
+      return jsonResponse(request, env, 200, {
+        ok: true,
+        blueprint: best.blueprint,
+        extractedSubject: best.extractedSubject,
+        modelUsed: best.modelUsed,
       });
     } catch (err) {
       attempts.push(`${model}: ${redactKey(err, apiKey).slice(0, 100)}`);
     }
+  }
+
+  if (best) {
+    return jsonResponse(request, env, 200, {
+      ok: true,
+      blueprint: best.blueprint,
+      extractedSubject: best.extractedSubject,
+      modelUsed: best.modelUsed,
+    });
   }
 
   const summary = attempts.join(" | ") || "Model generation failed.";
