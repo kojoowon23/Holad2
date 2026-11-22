@@ -10,17 +10,26 @@ export interface WorkerEnv {
 }
 
 const DEFAULT_SCULPT_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-3.1-pro-preview",
+  "hydrogen-l",
+  "gemini-4-hydrogen",
+  "gemini-4-argon",
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
   "gemini-2.5-pro",
-  "gemini-2.0-flash",
 ] as const;
 
 const DEFAULT_MINIGAME_MODELS = [
+  "gemini-3.1-flash-lite",
+  "gemini-3.8-flash",
   "gemini-2.5-flash-lite",
   "gemini-2.5-flash",
-  "gemini-2.0-flash",
 ] as const;
+
+const HYDROGEN_OR_MODERN_RE = /^(?:hydrogen|gemini-(?:[0-9.]+-hydrogen|4|3\.8))(?:$|[-_.])/i;
+const OMIT_TEMP_MODEL_RE = /^gemini-(?:4|3\.8)(?:$|[-_.])/i;
 
 const BLOCKED_PATTERNS = [
   /\b(nazi|swastika|hitler|kkk|child\s*porn|csam|rape|suicide\s*bomb|beheading|pornography|genitalia)\b/i,
@@ -269,6 +278,58 @@ function parseModelOrder(configured: string | undefined, defaults: readonly stri
   return [...new Set(raw)];
 }
 
+async function discoverFallbackModels(
+  apiKey: string,
+  excludeModels: readonly string[],
+): Promise<string[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3_500);
+  try {
+    const res = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=250",
+      {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          accept: "application/json",
+          "x-goog-api-key": apiKey,
+        },
+      },
+    );
+    clearTimeout(timer);
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      models?: { name?: string; supportedGenerationMethods?: string[] }[];
+    };
+    const skip = new Set(excludeModels);
+    const out: string[] = [];
+    for (const entry of data.models ?? []) {
+      const id = String(entry?.name ?? "").trim().replace(/^models\//, "");
+      if (!id || skip.has(id) || !/^[a-zA-Z0-9._-]+$/.test(id)) continue;
+      const methods = entry?.supportedGenerationMethods;
+      if (Array.isArray(methods) && methods.length > 0 && !methods.includes("generateContent")) {
+        continue;
+      }
+      if (/(?:embedding|imagen|veo|lyria|aqa|tts|audio|image|robotics|computer-use|deep-research)/i.test(id)) {
+        continue;
+      }
+      if (/^(?:gemini|hydrogen)/i.test(id)) {
+        out.push(id);
+      }
+    }
+    // Prefer flash / hydrogen text models first
+    out.sort((a, b) => {
+      const score = (m: string) =>
+        /flash/i.test(m) ? 0 : /hydrogen/i.test(m) ? 1 : /pro/i.test(m) ? 2 : 3;
+      return score(a) - score(b);
+    });
+    return out.slice(0, 5);
+  } catch {
+    clearTimeout(timer);
+    return [];
+  }
+}
+
 async function callGeminiRest(opts: {
   model: string;
   apiKey: string;
@@ -287,22 +348,30 @@ async function callGeminiRest(opts: {
 
   try {
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(opts.model)}:generateContent`;
-    const supportsThinking = /^gemini-2\.5|^gemini-3/i.test(opts.model);
-    let useThinking = supportsThinking && typeof opts.thinkingBudget === "number" && opts.thinkingBudget >= 0;
+    const isModernOrHydrogen = HYDROGEN_OR_MODERN_RE.test(opts.model);
+    let thinkingMode: "native" | "budget" | "none" = isModernOrHydrogen
+      ? "native"
+      : /^gemini-2\.5|^gemini-3/i.test(opts.model) &&
+          typeof opts.thinkingBudget === "number" &&
+          opts.thinkingBudget > 0
+        ? "budget"
+        : "none";
+    let temperature = OMIT_TEMP_MODEL_RE.test(opts.model) ? undefined : opts.temperature;
+    let maxOutputTokens = opts.maxOutputTokens;
     let useJsonMime = true;
 
     const sendOnce = async () => {
       const generationConfig: Record<string, unknown> = {
-        maxOutputTokens: opts.maxOutputTokens,
+        maxOutputTokens,
         ...(useJsonMime ? { responseMimeType: "application/json" } : {}),
       };
-      if (typeof opts.temperature === "number") {
-        generationConfig.temperature = opts.temperature;
+      if (typeof temperature === "number") {
+        generationConfig.temperature = temperature;
       }
-      if (useThinking) {
-        generationConfig.thinkingConfig = {
-          thinkingBudget: opts.thinkingBudget,
-        };
+      if (thinkingMode === "native") {
+        generationConfig.thinkingConfig = { includeThoughts: true };
+      } else if (thinkingMode === "budget") {
+        generationConfig.thinkingConfig = { thinkingBudget: opts.thinkingBudget };
       }
       return fetch(endpoint, {
         method: "POST",
@@ -320,28 +389,32 @@ async function callGeminiRest(opts: {
     };
 
     let res = await sendOnce();
-    if (!res.ok && res.status === 400) {
-      const errBody = await res.text().catch(() => "");
-      if (useThinking && /thinking|thought/i.test(errBody)) {
-        useThinking = false;
-        res = await sendOnce();
-      } else if (useJsonMime && /mime|json/i.test(errBody)) {
+    let lastErrBody = "";
+    for (let compatPass = 0; compatPass < 3 && !res.ok && res.status === 400; compatPass++) {
+      lastErrBody = await res.text().catch(() => "");
+      let adjusted = false;
+      if (thinkingMode !== "none" && /thinking|thought/i.test(lastErrBody)) {
+        thinkingMode = "none";
+        adjusted = true;
+      } else if (temperature !== undefined && /temperature|sampling/i.test(lastErrBody)) {
+        temperature = undefined;
+        adjusted = true;
+      } else if (maxOutputTokens > 16_384 && /max_?output_?tokens|output.*token|token.*limit/i.test(lastErrBody)) {
+        maxOutputTokens = 16_384;
+        adjusted = true;
+      } else if (useJsonMime && /mime|json/i.test(lastErrBody)) {
         useJsonMime = false;
-        res = await sendOnce();
-      } else {
-        clearTimeout(timer);
-        return {
-          ok: false,
-          httpStatus: res.status,
-          reason: `HTTP ${res.status}: ${redactKey(errBody.slice(0, 160), opts.apiKey)}`,
-        };
+        adjusted = true;
       }
+      if (!adjusted) break;
+      lastErrBody = "";
+      res = await sendOnce();
     }
 
     clearTimeout(timer);
 
     if (!res.ok) {
-      const errBody = await res.text().catch(() => "");
+      const errBody = lastErrBody || (await res.text().catch(() => ""));
       return {
         ok: false,
         httpStatus: res.status,
@@ -446,9 +519,12 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
   userParts.push({ text: userDirective });
 
   const models = parseModelOrder(env.GEMINI_SCULPT_MODEL, DEFAULT_SCULPT_MODELS);
-  let lastError = "Model generation failed.";
+  const attempts: string[] = [];
+  let saw404 = false;
+  let discoveredTried = false;
 
-  for (const model of models) {
+  for (let idx = 0; idx < models.length; idx++) {
+    const model = models[idx];
     const res = await callGeminiRest({
       model,
       apiKey,
@@ -457,16 +533,23 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
       temperature: 0.42,
       maxOutputTokens: 24_576,
       thinkingBudget: 512,
-      timeoutMs: 45_000,
+      timeoutMs: 32_000,
     });
 
     if (!res.ok) {
-      lastError = `${model}: ${res.reason}`;
+      const note = `${model}: ${res.reason}`;
+      attempts.push(note);
+      if (res.httpStatus === 404) saw404 = true;
       if (/API_KEY_INVALID|API key not valid|invalid api key/i.test(res.reason)) {
         return jsonResponse(request, env, 502, {
           ok: false,
           error: "Worker GEMINI_API_KEY secret is invalid — check your Gemini API key.",
         });
+      }
+      if (!discoveredTried && saw404 && idx === models.length - 1) {
+        discoveredTried = true;
+        const extra = await discoverFallbackModels(apiKey, models);
+        models.push(...extra);
       }
       continue;
     }
@@ -493,7 +576,7 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
       }
 
       if (!Array.isArray(json.ops) || json.ops.length === 0) {
-        lastError = `${model}: Missing ops in blueprint`;
+        attempts.push(`${model}: Missing ops in blueprint`);
         continue;
       }
 
@@ -513,14 +596,15 @@ async function handleBuild(request: Request, env: WorkerEnv): Promise<Response> 
         modelUsed: model,
       });
     } catch (err) {
-      lastError = `${model}: ${redactKey(err, apiKey).slice(0, 120)}`;
+      attempts.push(`${model}: ${redactKey(err, apiKey).slice(0, 100)}`);
     }
   }
 
+  const summary = attempts.join(" | ") || "Model generation failed.";
   return jsonResponse(request, env, 502, {
     ok: false,
-    error: `Could not sculpt right now (${lastError.slice(0, 120)})`,
-    detail: lastError,
+    error: `Could not sculpt right now (${summary.slice(0, 160)})`,
+    detail: summary,
   });
 }
 
